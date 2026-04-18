@@ -1,0 +1,161 @@
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main]
+
+env:
+  ARTIFACT_SHA: ${{ github.sha }}
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+jobs:
+  build-deploy:
+    name: Build, Upload & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      # -----------------------------------------------------------------------
+      # 1. Build frontend
+      # -----------------------------------------------------------------------
+      - name: Install & Build Frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Zip frontend dist
+        run: |
+          mkdir -p artifacts
+          cd frontend/dist
+          zip -r ../../artifacts/frontend-${{ env.ARTIFACT_SHA }}.zip .
+
+      # -----------------------------------------------------------------------
+      # 2. Package backend (source + package files, no devDeps)
+      # -----------------------------------------------------------------------
+      - name: Zip backend source
+        run: |
+          mkdir -p artifacts
+          zip -r artifacts/backend-${{ env.ARTIFACT_SHA }}.zip \
+            backend/src \
+            backend/package.json \
+            backend/package-lock.json
+
+      # -----------------------------------------------------------------------
+      # 3. Azure Login (OIDC — no long-lived secrets)
+      # -----------------------------------------------------------------------
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # -----------------------------------------------------------------------
+      # 4. Upload artifacts to Blob Storage
+      # -----------------------------------------------------------------------
+      - name: Upload artifacts to Azure Blob Storage
+        run: |
+          az storage blob upload \
+            --account-name ${{ vars.ARTIFACT_STORAGE_ACCOUNT }} \
+            --container-name artifacts \
+            --name backend-${{ env.ARTIFACT_SHA }}.zip \
+            --file artifacts/backend-${{ env.ARTIFACT_SHA }}.zip \
+            --auth-mode login \
+            --overwrite
+
+          az storage blob upload \
+            --account-name ${{ vars.ARTIFACT_STORAGE_ACCOUNT }} \
+            --container-name artifacts \
+            --name frontend-${{ env.ARTIFACT_SHA }}.zip \
+            --file artifacts/frontend-${{ env.ARTIFACT_SHA }}.zip \
+            --auth-mode login \
+            --overwrite
+
+      # -----------------------------------------------------------------------
+      # 5. Generate SAS token for VM to download backend artifact (1 hour)
+      # -----------------------------------------------------------------------
+      - name: Generate SAS token for backend artifact
+        id: sas
+        run: |
+          EXPIRY=$(date -u -d '+1 hour' '+%Y-%m-%dT%H:%MZ')
+          SAS=$(az storage blob generate-sas \
+            --account-name ${{ vars.ARTIFACT_STORAGE_ACCOUNT }} \
+            --container-name artifacts \
+            --name backend-${{ env.ARTIFACT_SHA }}.zip \
+            --permissions r \
+            --expiry "$EXPIRY" \
+            --auth-mode login \
+            --as-user \
+            --output tsv)
+          BLOB_URL="https://${{ vars.ARTIFACT_STORAGE_ACCOUNT }}.blob.core.windows.net/artifacts/backend-${{ env.ARTIFACT_SHA }}.zip?${SAS}"
+          echo "blob_url=$BLOB_URL" >> $GITHUB_OUTPUT
+
+      # -----------------------------------------------------------------------
+      # 6. Deploy backend to Windows VM via az vm run-command
+      # -----------------------------------------------------------------------
+      - name: Deploy backend to Windows VM
+        run: |
+          az vm run-command invoke \
+            --resource-group ${{ vars.RESOURCE_GROUP_DEV }} \
+            --name ${{ vars.VM_NAME_DEV }} \
+            --command-id RunPowerShellScript \
+            --scripts @scripts/deploy-backend.ps1 \
+            --parameters \
+              "ArtifactUrl=${{ steps.sas.outputs.blob_url }}" \
+              "Sha=${{ env.ARTIFACT_SHA }}"
+
+      # -----------------------------------------------------------------------
+      # 7. Deploy frontend to Azure App Service (zip deploy)
+      # -----------------------------------------------------------------------
+      - name: Deploy frontend to App Service
+        run: |
+          az webapp deploy \
+            --resource-group ${{ vars.RESOURCE_GROUP_DEV }} \
+            --name ${{ vars.FRONTEND_APP_NAME_DEV }} \
+            --src-path artifacts/frontend-${{ env.ARTIFACT_SHA }}.zip \
+            --type zip
+
+      # -----------------------------------------------------------------------
+      # 8. Update artifact-versions.json in infra repo (handoff)
+      # -----------------------------------------------------------------------
+      - name: Checkout infra repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.INFRA_REPO }}   # rajanktest1/devops_ecom_2infra
+          token: ${{ secrets.INFRA_REPO_PAT }}
+          path: infra-repo
+
+      - name: Write artifact-versions.json
+        run: |
+          cat > infra-repo/versions/artifact-versions.json <<EOF
+          {
+            "sha": "${{ env.ARTIFACT_SHA }}",
+            "backend_artifact": "backend-${{ env.ARTIFACT_SHA }}.zip",
+            "frontend_artifact": "frontend-${{ env.ARTIFACT_SHA }}.zip",
+            "storage_account": "${{ vars.ARTIFACT_STORAGE_ACCOUNT }}",
+            "updated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "triggered_by": "${{ github.actor }}"
+          }
+          EOF
+
+      - name: Push artifact-versions.json to infra repo
+        working-directory: infra-repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add versions/artifact-versions.json
+          git diff --cached --quiet || git commit -m "chore: bump artifacts to ${{ env.ARTIFACT_SHA }}"
+          git push
